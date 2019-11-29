@@ -18,6 +18,7 @@
 @implementation File
 
 @synthesize process;
+@synthesize timestamp;
 @synthesize sourcePath;
 @synthesize destinationPath;
 
@@ -30,6 +31,9 @@
     {
         //set type
         self.event = message->event_type;
+        
+        //set timestamp
+        self.timestamp = [NSDate date];
         
         //set process
         self.process = [[Process alloc] init:message];
@@ -52,11 +56,37 @@
         
         //create
         case ES_EVENT_TYPE_NOTIFY_CREATE:
+        {
             
-            //set path
-            self.destinationPath = convertStringToken(&message->event.create.destination.new_path.filename);
+            //directory
+            NSString* directory = nil;
+            
+            //file name
+            NSString* fileName = nil;
+            
+            //existing file?
+            // grab file path
+            if(ES_DESTINATION_TYPE_EXISTING_FILE == message->event.create.destination_type)
+            {
+                //set path
+                self.destinationPath = convertStringToken(&message->event.create.destination.existing_file->path);
+            }
+            //new file
+            // build file path from directory + name
+            else
+            {
+                //extract directory
+                directory = convertStringToken(&message->event.create.destination.new_path.dir->path);
+                
+                //extact file name
+                fileName = convertStringToken(&message->event.create.destination.new_path.filename);
+                
+                //combine
+                self.destinationPath = [directory stringByAppendingPathComponent:fileName];
+            }
             
             break;
+        }
             
         //open
         case ES_EVENT_TYPE_NOTIFY_OPEN:
@@ -191,7 +221,10 @@
             break;
     }
     
-    //start process
+    //add timestamp
+    [description appendFormat:@"\"timestamp\":\"%@\",", self.timestamp];
+    
+    //start file
     [description appendString:@"\"file\":{"];
     
     //src path
