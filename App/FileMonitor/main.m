@@ -13,7 +13,7 @@ int main(int argc, const char * argv[]) {
     
     //return var
     int status = -1;
-
+    
     @autoreleasepool {
         
         //args
@@ -97,7 +97,7 @@ void usage()
     return;
 }
 
-//process args
+//process user-specifed args
 BOOL processArgs(NSArray* arguments)
 {
     //flag
@@ -143,7 +143,8 @@ bail:
 BOOL monitor()
 {
     //events of interest
-    es_event_type_t events[] = {ES_EVENT_TYPE_NOTIFY_CREATE, ES_EVENT_TYPE_NOTIFY_OPEN, ES_EVENT_TYPE_NOTIFY_WRITE, ES_EVENT_TYPE_NOTIFY_CLOSE, ES_EVENT_TYPE_NOTIFY_RENAME, ES_EVENT_TYPE_NOTIFY_LINK, ES_EVENT_TYPE_NOTIFY_UNLINK};
+    // note: also pass in process exec/exit to capture args
+    es_event_type_t events[] = {ES_EVENT_TYPE_NOTIFY_CREATE, ES_EVENT_TYPE_NOTIFY_OPEN, ES_EVENT_TYPE_NOTIFY_WRITE, ES_EVENT_TYPE_NOTIFY_CLOSE, ES_EVENT_TYPE_NOTIFY_RENAME, ES_EVENT_TYPE_NOTIFY_LINK, ES_EVENT_TYPE_NOTIFY_UNLINK, ES_EVENT_TYPE_NOTIFY_EXEC, ES_EVENT_TYPE_NOTIFY_EXIT};
 
     //init monitor
     FileMonitor* fileMon = [[FileMonitor alloc] init];
@@ -158,7 +159,7 @@ BOOL monitor()
         
         //ingore apple?
         if( (YES == skipApple) &&
-            (YES == [file.process.signingInfo[KEY_SIGNATURE_PLATFORM_BINARY] boolValue]))
+            (YES == file.process.isPlatformBinary.boolValue))
         {
             //ignore
             return;
@@ -193,8 +194,7 @@ BOOL monitor()
         
     //start monitoring
     // pass in events, count, and callback block for events
-    return [fileMon start:events count:sizeof(events)/sizeof(events[0]) callback:block];
-            
+    return [fileMon start:events count:sizeof(events)/sizeof(events[0]) csOption:csStatic callback:block];
 }
 
 //prettify JSON
@@ -202,6 +202,9 @@ NSString* prettifyJSON(NSString* output)
 {
     //data
     NSData* data = nil;
+    
+    //error
+    NSError* error = nil;
     
     //object
     id object = nil;
@@ -214,33 +217,44 @@ NSString* prettifyJSON(NSString* output)
     
     //covert to data
     data = [output dataUsingEncoding:NSUTF8StringEncoding];
-    
+   
     //convert to JSON
     // wrap since we are serializing JSON
     @try
     {
         //serialize
-        object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        object = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+        if(nil == object)
+        {
+            //bail
+            goto bail;
+        }
         
         //covert to pretty data
-        prettyData =  [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingPrettyPrinted error:nil];
+        prettyData = [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingPrettyPrinted error:&error];
+        if(nil == prettyData)
+        {
+            //bail
+            goto bail;
+        }
     }
     //ignore exceptions (here)
     @catch(NSException *exception)
     {
-        ;
+        //bail
+        goto bail;
     }
     
-    //covert to pretty string
-    if(nil != prettyData)
+    //convert to string
+    // note, we manually unescape forward slashes
+    prettyString = [[[NSString alloc] initWithData:prettyData encoding:NSUTF8StringEncoding] stringByReplacingOccurrencesOfString:@"\\/" withString:@"/"];
+   
+bail:
+    
+    //error?
+    if(nil == prettyString)
     {
-        //convert to string
-        // note, we manually unescape forward slashes
-        prettyString = [[[NSString alloc] initWithData:prettyData encoding:NSUTF8StringEncoding] stringByReplacingOccurrencesOfString:@"\\/" withString:@"/"];
-    }
-    else
-    {
-        //error
+        //init error
         prettyString = @"{\"error\" : \"failed to convert output to JSON\"}";
     }
     

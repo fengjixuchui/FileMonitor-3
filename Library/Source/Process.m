@@ -1,6 +1,6 @@
 //
 //  Process.m
-//  FileMonitor
+//  ProcessMonitor
 //
 //  Created by Patrick Wardle on 9/1/19.
 //  Copyright © 2019 Objective-See. All rights reserved.
@@ -10,8 +10,15 @@
 #import <bsm/libbsm.h>
 #import <sys/sysctl.h>
 
+#import "signing.h"
 #import "utilities.h"
 #import "FileMonitor.h"
+
+/* GLOBALS */
+
+//resp
+extern pid_t (*getRPID)(pid_t pid);
+
 
 /* FUNCTIONS */
 
@@ -23,6 +30,7 @@ pid_t getParentID(pid_t child);
 
 @synthesize pid;
 @synthesize exit;
+@synthesize name;
 @synthesize path;
 @synthesize ppid;
 @synthesize event;
@@ -32,7 +40,8 @@ pid_t getParentID(pid_t child);
 @synthesize signingInfo;
 
 //init
--(id)init:(es_message_t*)message
+// flag controls code signing options
+-(id)init:(es_message_t*)message csOption:(NSUInteger)csOption
 {
     //init super
     self = [super init];
@@ -41,11 +50,15 @@ pid_t getParentID(pid_t child);
         //process from msg
         es_process_t* process = NULL;
         
+        //string value
+        // used for various conversions
+        NSString* string = nil;
+        
         //alloc array for args
         self.arguments = [NSMutableArray array];
         
         //alloc array for parents
-        self.ancestors  = [NSMutableArray array];
+        self.ancestors = [NSMutableArray array];
         
         //alloc dictionary for signing info
         self.signingInfo = [NSMutableDictionary dictionary];
@@ -66,9 +79,9 @@ pid_t getParentID(pid_t child);
         self.event = message->event_type;
         
         //event specific logic
-        // set type
-        // extract (relevant) process object, etc
-        switch (message->event_type) {
+        // a) set type
+        // b) extract (relevant) process object, etc
+        switch(message->event_type) {
             
             //exec
             case ES_EVENT_TYPE_NOTIFY_EXEC:
@@ -111,6 +124,14 @@ pid_t getParentID(pid_t child);
         
         //init pid
         self.pid = audit_token_to_pid(process->audit_token);
+        if(0 == self.pid)
+        {
+            //unset
+            self = nil;
+        
+            //bail
+            goto bail;
+        }
         
         //init ppid
         self.ppid = process->ppid;
@@ -121,17 +142,101 @@ pid_t getParentID(pid_t child);
         //init path
         self.path = convertStringToken(&process->executable->path);
         
-        //extract/format code signing info
-        [self extractSigningInfo:process];
+        //now generate name
+        [self generateName];
+    
+        //add cs flags
+        self.csFlags = [NSNumber numberWithUnsignedInt:process->codesigning_flags];
+        
+        //convert/add signing id
+        if(nil != (string = convertStringToken(&process->signing_id)))
+        {
+            //add
+            self.signingID = string;
+        }
+        
+        //convert/add team id
+        if(nil != (string = convertStringToken(&process->team_id)))
+        {
+            //add
+            self.teamID = string;
+        }
+        
+        //add platform binary
+        self.isPlatformBinary = [NSNumber numberWithBool:process->is_platform_binary];
+        
+        //save cd hash
+        self.cdHash = [[NSString alloc] initWithData:[NSData dataWithBytes:(const void *)process->cdhash length:sizeof(uint8_t)*CS_CDHASH_LEN] encoding:NSUTF8StringEncoding];
+        
+        //when specified
+        // generate full code signing info
+        if(csNone != csOption)
+        {
+            //generate code signing info
+            [self generateCSInfo:csOption];
+        }
         
         //enum ancestors
         [self enumerateAncestors];
-        
     }
+    
+bail:
     
     return self;
 }
 
+//generate code signing info
+// sets 'signingInfo' iVar with resuls
+-(void)generateCSInfo:(NSUInteger)csOption
+{
+    //generate via helper function
+    self.signingInfo = generateSigningInfo(self, csOption, kSecCSDefaultFlags);
+    
+    return;
+}
+
+//get process' name
+// either via app bundle, or path
+-(void)generateName
+{
+    //app path
+    NSString* appPath = nil;
+    
+    //app bundle
+    NSBundle* appBundle = nil;
+    
+    //convert path to app path
+    // generally, <blah.app>/Contents/MacOS/blah
+    appPath = [[[self.path stringByDeletingLastPathComponent] stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+    if(YES != [appPath hasSuffix:@".app"])
+    {
+        //bail
+        goto bail;
+    }
+    
+    //try load bundle
+    // and verify it's the 'right' bundle
+    appBundle = [NSBundle bundleWithPath:appPath];
+    if( (nil != appBundle) &&
+        (YES == [appBundle.executablePath isEqualToString:self.path]) )
+    {
+        //grab name from app's bundle
+        self.name = [appBundle infoDictionary][@"CFBundleDisplayName"];
+    }
+    
+bail:
+    
+    //still nil?
+    // just grab from path
+    if(nil == self.name)
+    {
+        //from path
+        self.name = [self.path lastPathComponent];
+    }
+    
+    
+    return;
+}
 //extract/format args
 -(void)extractArgs:(es_events_t *)event
 {
@@ -172,56 +277,6 @@ bail:
     return;
 }
 
-//extract/format signing info
--(void)extractSigningInfo:(es_process_t *)process
-{
-    //cd hash
-    NSMutableString* cdHash = nil;
-    
-    //signing id
-    NSString* signingID = nil;
-    
-    //team id
-    NSString* teamID = nil;
-    
-    //alloc string for hash
-    cdHash = [NSMutableString string];
-    
-    //add flags
-    self.signingInfo[KEY_SIGNATURE_FLAGS] = [NSNumber numberWithUnsignedInt:process->codesigning_flags];
-    
-    //convert/add signing id
-    signingID = convertStringToken(&process->signing_id);
-    if(nil != signingID)
-    {
-        //add
-        self.signingInfo[KEY_SIGNATURE_IDENTIFIER] = signingID;
-    }
-    
-    //convert/add team id
-    teamID = convertStringToken(&process->team_id);
-    if(nil != teamID)
-    {
-        //add
-        self.signingInfo[KEY_SIGNATURE_TEAM_IDENTIFIER] = teamID;
-    }
-    
-    //add platform binary
-    self.signingInfo[KEY_SIGNATURE_PLATFORM_BINARY] = [NSNumber numberWithBool:process->is_platform_binary];
-    
-    //format cdhash
-    for(uint32_t i = 0; i<CS_CDHASH_LEN; i++)
-    {
-        //append
-        [cdHash appendFormat:@"%X", process->cdhash[i]];
-    }
-    
-    //add cdhash
-    self.signingInfo[KEY_SIGNATURE_CDHASH] = cdHash;
-    
-    return;
-}
-
 //generate list of ancestors
 -(void)enumerateAncestors
 {
@@ -231,30 +286,54 @@ bail:
     //parent pid
     pid_t parentPID = -1;
     
+    //for parent
+    // first try rPID
+    if(NULL != getRPID)
+    {
+        //get rpid
+        parentPID = getRPID(pid);
+    }
+    
+    //couldn't find/get rPID?
+    // default back to using ppid
+    if( (parentPID <= 0) ||
+        (self.pid == parentPID) )
+    {
+        //use ppid
+        parentPID = self.ppid;
+    }
+    
+    //add self
+    [self.ancestors addObject:[NSNumber numberWithInt:self.pid]];
+    
     //add parent
-    if(-1 != self.ppid)
-    {
-        //add
-        [self.ancestors addObject:[NSNumber numberWithInt:self.ppid]];
+    [self.ancestors addObject:[NSNumber numberWithInt:parentPID]];
         
-        //set current to parent
-        currentPID = self.ppid;
-    }
-    //don't know parent
-    // just start with self
-    else
-    {
-        //start w/ self
-        currentPID = self.pid;
-    }
+    //set current to parent
+    currentPID = parentPID;
     
     //complete ancestry
     while(YES)
     {
-        //get parent pid
-        parentPID = getParentID(currentPID);
-        if( (0 == parentPID) ||
-            (-1 == parentPID) ||
+        //for parent
+        // first try via rPID
+        if(NULL != getRPID)
+        {
+            //get rpid
+            parentPID = getRPID(currentPID);
+        }
+        
+        //couldn't find/get rPID?
+        // default back to using standard method
+        if( (parentPID <= 0) ||
+            (currentPID == parentPID) )
+        {
+            //get parent pid
+            parentPID = getParentID(currentPID);
+        }
+        
+        //done?
+        if( (parentPID <= 0) ||
             (currentPID == parentPID) )
         {
             //bail
@@ -285,7 +364,7 @@ bail:
     [description appendString:@"\"process\":{"];
     
     //add pid, path, etc
-    [description appendFormat: @"\"pid\":%d,\"path\":\"%@\",\"uid\":%d," ,self.pid, self.path, self.uid];
+    [description appendFormat: @"\"pid\":%d,\"path\":\"%@\",\"uid\":%d,",self.pid, self.path, self.uid];
     
     //arguments
     if(0 != self.arguments.count)
@@ -323,7 +402,7 @@ bail:
     //add ancestors
     [description appendFormat:@"\"ancestors\":["];
     
-    //add all arguments
+    //add each ancestor
     for(NSNumber* ancestor in self.ancestors)
     {
         //add
@@ -340,8 +419,17 @@ bail:
     //terminate list
     [description appendString:@"],"];
     
+    //signing info (reported)
+    [description appendString:@"\"signing info (reported)\":{"];
+ 
+    //add cs flags, signing id, team id, etc
+    [description appendFormat: @"\"csFlags\":%d,\"platformBinary\":%d,\"signingID\":\"%@\",\"teamID\":\"%@\",\"cdHash\":\"%@\",", self.csFlags.intValue, self.isPlatformBinary.intValue, self.signingID, self.teamID, self.cdHash];
+ 
+    //terminate dictionary
+    [description appendString:@"},"];
+ 
     //signing info
-    [description appendString:@"\"signing info\":{"];
+    [description appendString:@"\"signing info (computed)\":{"];
     
     //add all key/value pairs from signing info
     for(NSString* key in self.signingInfo)
@@ -349,21 +437,82 @@ bail:
         //value
         id value = self.signingInfo[key];
         
+        //handle `KEY_SIGNATURE_SIGNER`
+        if(YES == [key isEqualToString:KEY_SIGNATURE_SIGNER])
+        {
+            //convert to pritable
+            switch ([value intValue]) {
+            
+                //'None'
+                case None:
+                    [description appendFormat:@"\"%@\":\"%@\",", key, @"none"];
+                    break;
+                    
+                //'Apple'
+                case Apple:
+                    [description appendFormat:@"\"%@\":\"%@\",", key, @"Apple"];
+                    break;
+                
+                //'App Store'
+                case AppStore:
+                    [description appendFormat:@"\"%@\":\"%@\",", key, @"App Store"];
+                    break;
+                    
+                //'Developer ID'
+                case DevID:
+                    [description appendFormat:@"\"%@\":\"%@\",", key, @"Developer ID"];
+                    break;
+    
+                //'AdHoc'
+                case AdHoc:
+                   [description appendFormat:@"\"%@\":\"%@\",", key, @"AdHoc"];
+                   break;
+                    
+                default:
+                    break;
+            }
+        }
+        
         //number?
         // add as is
-        if(YES == [value isKindOfClass:[NSNumber class]])
+        else if(YES == [value isKindOfClass:[NSNumber class]])
         {
             //add
             [description appendFormat:@"\"%@\":%@,", key, value];
         }
-        //otherwise, escape
+        //array
+        else if(YES == [value isKindOfClass:[NSArray class]])
+        {
+            //start
+            [description appendFormat:@"\"%@\":[", key];
+            
+            //add each item
+            [value enumerateObjectsUsingBlock:^(id obj, NSUInteger index, BOOL * _Nonnull stop) {
+                
+                //add
+                [description appendFormat:@"\"%@\"", obj];
+                
+                //add ','
+                if(index != ((NSArray*)value).count-1)
+                {
+                    //add
+                    [description appendString:@","];
+                }
+                
+            }];
+            
+            //terminate
+            [description appendString:@"],"];
+        }
+        //otherwise
+        // just escape it
         else
         {
             //add
             [description appendFormat:@"\"%@\":\"%@\",", key, value];
         }
     }
-
+    
     //remove last ','
     if(YES == [description hasSuffix:@","])
     {
@@ -384,7 +533,7 @@ bail:
     
     //terminate process
     [description appendString:@"}"];
-    
+
     return description;
 }
 

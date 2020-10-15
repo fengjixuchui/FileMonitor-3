@@ -12,17 +12,60 @@
 #import "utilities.h"
 #import "FileMonitor.h"
 
+#import <dlfcn.h>
 #import <Foundation/Foundation.h>
 #import <EndpointSecurity/EndpointSecurity.h>
+
+/* GLOBALS */
 
 //endpoint client
 es_client_t *endpointClient = nil;
 
+//pointer to responsibility_get_pid_responsible_for_pid()
+pid_t (*getRPID)(pid_t pid) = NULL;
+
+//process cache
+NSCache* processCache = NULL;
+
+@interface FileMonitor ()
+
+//process args (via `ES_EVENT_TYPE_NOTIFY_EXEC`)
+// so save, to report with all other file i/o events
+@property(atomic, retain)NSMutableDictionary* arguments;
+
+@end
+
 @implementation FileMonitor
+
+//args
+@synthesize arguments;
+
+//init
+-(id)init
+{
+    //init super
+    self = [super init];
+    if(nil != self)
+    {
+        //alloc agrugments dictionary
+        arguments = [NSMutableDictionary dictionary];
+        
+        //get function pointer
+        getRPID = dlsym(RTLD_NEXT, "responsibility_get_pid_responsible_for_pid");
+        
+        //init process cache
+        processCache = [[NSCache alloc] init];
+        
+        //set cache limit
+        processCache.countLimit = 2048;
+    }
+    
+    return self;
+}
 
 //start monitoring
 // pass in events of interest, count of said events, and callback
--(BOOL)start:(es_event_type_t*)events count:(uint32_t)count callback:(FileCallbackBlock)callback
+-(BOOL)start:(es_event_type_t*)events count:(uint32_t)count csOption:(NSUInteger)csOption callback:(FileCallbackBlock)callback
 {
     //flag
     BOOL started = NO;
@@ -42,9 +85,28 @@ es_client_t *endpointClient = nil;
         File* file = nil;
         
         //init file obj
-        file = [[File alloc] init:(es_message_t* _Nonnull)message];
+        // then generate args, code-signing info, etc
+        file = [[File alloc] init:(es_message_t* _Nonnull)message csOption:csOption];
         if(nil != file)
         {
+            //extract/process args
+            // but don't report file event...
+            if( (ES_EVENT_TYPE_NOTIFY_EXEC == message->event_type) ||
+                (ES_EVENT_TYPE_NOTIFY_EXIT == message->event_type) )
+            {
+                //process args
+                [self processArgs:message file:file];
+                
+                return;
+            }
+                
+            //add args
+            if(nil != self.arguments[[NSNumber numberWithInt:file.process.pid]])
+            {
+                //add
+                file.process.arguments = self.arguments[[NSNumber numberWithInt:file.process.pid]];
+            }
+        
             //invoke user callback
             callback(file);
         }
@@ -54,7 +116,7 @@ es_client_t *endpointClient = nil;
     if(ES_NEW_CLIENT_RESULT_SUCCESS != result)
     {
         //err msg
-        NSLog(@"ERROR: es_new_client() failed");
+        NSLog(@"ERROR: es_new_client() failed with %#x", result);
         
         //provide more info
         switch (result) {
@@ -115,6 +177,29 @@ es_client_t *endpointClient = nil;
 bail:
     
     return started;
+}
+
+//process args
+-(void)processArgs:(const es_message_t*)message file:(File*)file
+{
+    //process exec?
+    // save arguments
+    if( (nil != file.process.arguments) &&
+        (ES_EVENT_TYPE_NOTIFY_EXEC == message->event_type) )
+    {
+        //save args
+        self.arguments[[NSNumber numberWithInt:file.process.pid]] = file.process.arguments;
+    }
+    
+    //process exit?
+    // remove saved process args
+    else if(ES_EVENT_TYPE_NOTIFY_EXIT == message->event_type)
+    {
+        //remove args
+        [self.arguments removeObjectForKey:[NSNumber numberWithInt:file.process.pid]];
+    }
+    
+    return;
 }
 
 //stop
